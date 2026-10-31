@@ -19,7 +19,7 @@
 use crate::foreign::{self, CallMode};
 use crate::model::{
     as_addr_of, collect_addr_of_roots, collect_ref_roots, move_operand_ident, unwrap_parens, Binding, Checker, FnState,
-    Loan, LoanTarget, MoveKind, TypeShape,
+    Loan, LoanTarget, LoopBreakSnapshot, MoveKind, TypeShape,
 };
 use crate::shape::receiver_type_name;
 use crate::walk::{self, CallRef};
@@ -3078,10 +3078,12 @@ impl<'a> Checker<'a> {
             param_names.insert((*name).to_string());
         }
         let mut out: HashSet<(usize, usize)> = HashSet::new();
+        let mut break_aliases = std::collections::HashMap::new();
         self.walk_block_param_stores(
             body,
             &mut cst,
             &mut aliases,
+            &mut break_aliases,
             &param_names,
             depth,
             &mut out,
@@ -3139,12 +3141,13 @@ impl<'a> Checker<'a> {
         block: &Block,
         cst: &mut FnState,
         aliases: &mut std::collections::HashMap<String, HashSet<usize>>,
+        break_aliases: &mut std::collections::HashMap<String, HashSet<usize>>,
         param_names: &HashSet<String>,
         depth: usize,
         out: &mut HashSet<(usize, usize)>,
     ) {
         for s in &block.stmts {
-            self.walk_stmt_param_stores(s, cst, aliases, param_names, depth, out);
+            self.walk_stmt_param_stores(s, cst, aliases, break_aliases, param_names, depth, out);
         }
     }
 
@@ -3153,6 +3156,7 @@ impl<'a> Checker<'a> {
         stmt: &Stmt,
         cst: &mut FnState,
         aliases: &mut std::collections::HashMap<String, HashSet<usize>>,
+        break_aliases: &mut std::collections::HashMap<String, HashSet<usize>>,
         param_names: &HashSet<String>,
         depth: usize,
         out: &mut HashSet<(usize, usize)>,
@@ -3378,6 +3382,14 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
+            Stmt::Break { .. } => {
+                for (k, v) in aliases.iter() {
+                    break_aliases
+                        .entry(k.clone())
+                        .or_default()
+                        .extend(v.clone());
+                }
+            }
             Stmt::If {
                 init,
                 then,
@@ -3391,6 +3403,7 @@ impl<'a> Checker<'a> {
                         i,
                         &mut branch_cst,
                         &mut branch_aliases,
+                        break_aliases,
                         param_names,
                         depth,
                         out,
@@ -3402,6 +3415,7 @@ impl<'a> Checker<'a> {
                     then,
                     &mut then_cst,
                     &mut then_aliases,
+                    break_aliases,
                     param_names,
                     depth,
                     out,
@@ -3416,6 +3430,7 @@ impl<'a> Checker<'a> {
                         o,
                         &mut else_cst,
                         &mut else_aliases,
+                        break_aliases,
                         param_names,
                         depth,
                         out,
@@ -3428,6 +3443,7 @@ impl<'a> Checker<'a> {
             Stmt::For { kind, body, .. } => {
                 let mut body_cst = cst.clone();
                 let mut body_aliases = aliases.clone();
+                let mut inner_breaks = std::collections::HashMap::new();
                 if let hy_syntax::ForKind::Iterate { vars, expr } = kind {
                     let shapes = self.iterate_var_shapes(&body_cst, expr, vars.len());
                     let raw = Self::raw_expr_slot_origins(expr, &body_aliases);
@@ -3458,6 +3474,7 @@ impl<'a> Checker<'a> {
                     body,
                     &mut body_cst,
                     &mut body_aliases,
+                    &mut inner_breaks,
                     param_names,
                     depth,
                     out,
@@ -3467,9 +3484,14 @@ impl<'a> Checker<'a> {
                         aliases.entry(k).or_default().extend(v);
                     }
                 }
+                for (k, v) in inner_breaks {
+                    if aliases.contains_key(&k) {
+                        aliases.entry(k).or_default().extend(v);
+                    }
+                }
             }
             Stmt::Managed { body, .. } | Stmt::Block { block: body, .. } => {
-                self.walk_block_param_stores(body, cst, aliases, param_names, depth, out);
+                self.walk_block_param_stores(body, cst, aliases, break_aliases, param_names, depth, out);
             }
             Stmt::Match { subject, arms, .. } => {
                 let subj_origins = self.expr_slot_origins(cst, subject, aliases);
@@ -3505,6 +3527,7 @@ impl<'a> Checker<'a> {
                         &arm.body,
                         &mut arm_cst,
                         &mut arm_aliases,
+                        break_aliases,
                         param_names,
                         depth,
                         out,
@@ -3524,6 +3547,7 @@ impl<'a> Checker<'a> {
                         &arm.body,
                         &mut arm_cst,
                         &mut arm_aliases,
+                        break_aliases,
                         param_names,
                         depth,
                         out,
@@ -6151,6 +6175,7 @@ impl<'a> Checker<'a> {
         let mut cst = st.clone();
         let flat = walk::flatten_with_results(body, &cst.named_results);
         cst.last_use = flat.last_use.clone();
+        let mut active_loops: Vec<(usize, usize, usize, Vec<LoopBreakSnapshot>)> = Vec::new();
         for (stmt, idx) in &flat.stmts {
             let idx = *idx;
             if let Some(evs) = flat.events.get(&idx) {
@@ -6396,7 +6421,10 @@ impl<'a> Checker<'a> {
                         self.record_assign_borrow_aliases(&mut cst, targets, *op, values);
                     }
                 }
-                Stmt::For { kind, .. } => match kind {
+                Stmt::For { kind, .. } => {
+                    let outer_depth = cst.scopes.len();
+                    active_loops.push((idx, flat.loop_end_of(idx), outer_depth, Vec::new()));
+                    match kind {
                     hy_syntax::ForKind::Iterate { vars, expr } => {
                         let is_chan =
                             matches!(self.shape_of_expr(&cst, expr), TypeShape::Chan(_));
@@ -6426,7 +6454,22 @@ impl<'a> Checker<'a> {
                         self.define_binding(&mut cst, var, TypeShape::Primitive, None, false, false, false);
                     }
                     _ => {}
-                },
+                }
+                }
+                Stmt::Break { label, .. } => {
+                    let in_enclosing_select = flat.select_end.iter().any(|(&s_start, &s_end)| {
+                        s_start < idx
+                            && idx <= s_end
+                            && active_loops
+                                .last()
+                                .map_or(true, |(f_idx, _, _, _)| *f_idx < s_start)
+                    });
+                    if (!in_enclosing_select || label.is_some()) && !active_loops.is_empty() {
+                        let target = active_loops.last_mut().unwrap();
+                        let od = target.2;
+                        target.3.push(LoopBreakSnapshot::capture(&cst, od));
+                    }
+                }
                 _ => {}
             }
 
@@ -6467,6 +6510,16 @@ impl<'a> Checker<'a> {
                     }
                 }
                 self.scan_closure_body(&mut merged, flit, &HashSet::new());
+            }
+
+            while let Some((_, loop_end, _, _)) = active_loops.last() {
+                if *loop_end != idx {
+                    break;
+                }
+                let (_, _, _, break_snaps) = active_loops.pop().unwrap();
+                for snap in &break_snaps {
+                    snap.apply(&mut cst);
+                }
             }
         }
     }
@@ -6879,7 +6932,7 @@ impl<'a> Checker<'a> {
                             || matches!(self.shape_of_type(&p.ty), TypeShape::Pointer(_));
                         let mut aliases = HashSet::new();
                         aliases.insert(p.name.clone());
-                        (is_ptr, self.block_mutates_const_param(body, &mut aliases, 0))
+                        (is_ptr, self.block_mutates_const_param(body, &mut aliases, &mut HashSet::new(), 0))
                     }
                     None => (false, true),
                 },
@@ -6924,17 +6977,18 @@ impl<'a> Checker<'a> {
         };
         let mut aliases = HashSet::new();
         aliases.insert(param.to_string());
-        self.block_mutates_const_param(body, &mut aliases, depth)
+        self.block_mutates_const_param(body, &mut aliases, &mut HashSet::new(), depth)
     }
 
     fn block_mutates_const_param(
         &self,
         block: &Block,
         aliases: &mut HashSet<String>,
+        break_aliases: &mut HashSet<String>,
         depth: usize,
     ) -> bool {
         for s in &block.stmts {
-            if self.stmt_mutates_const_param(s, aliases, depth) {
+            if self.stmt_mutates_const_param(s, aliases, break_aliases, depth) {
                 return true;
             }
         }
@@ -6965,6 +7019,7 @@ impl<'a> Checker<'a> {
         &self,
         stmt: &Stmt,
         aliases: &mut HashSet<String>,
+        break_aliases: &mut HashSet<String>,
         depth: usize,
     ) -> bool {
         match stmt {
@@ -7078,6 +7133,9 @@ impl<'a> Checker<'a> {
                     return true;
                 }
             }
+            Stmt::Break { .. } => {
+                break_aliases.extend(aliases.iter().cloned());
+            }
             _ => {}
         }
         let mut calls = Vec::new();
@@ -7097,18 +7155,18 @@ impl<'a> Checker<'a> {
             } => {
                 let mut branch_aliases = aliases.clone();
                 if let Some(i) = init {
-                    if self.stmt_mutates_const_param(i, &mut branch_aliases, depth) {
+                    if self.stmt_mutates_const_param(i, &mut branch_aliases, break_aliases, depth) {
                         return true;
                     }
                 }
                 let mut then_aliases = branch_aliases.clone();
-                if self.block_mutates_const_param(then, &mut then_aliases, depth) {
+                if self.block_mutates_const_param(then, &mut then_aliases, break_aliases, depth) {
                     return true;
                 }
                 aliases.extend(then_aliases);
                 if let Some(o) = otherwise {
                     let mut else_aliases = branch_aliases;
-                    if self.stmt_mutates_const_param(o, &mut else_aliases, depth) {
+                    if self.stmt_mutates_const_param(o, &mut else_aliases, break_aliases, depth) {
                         return true;
                     }
                     aliases.extend(else_aliases);
@@ -7116,6 +7174,7 @@ impl<'a> Checker<'a> {
             }
             Stmt::For { kind, body, .. } => {
                 let mut body_aliases = aliases.clone();
+                let mut inner_breaks = HashSet::new();
                 match kind {
                     hy_syntax::ForKind::Iterate { vars, expr } => {
                         let reaches = Self::expr_reaches_const_aliases(expr, &body_aliases);
@@ -7132,14 +7191,15 @@ impl<'a> Checker<'a> {
                     }
                     _ => {}
                 }
-                if self.block_mutates_const_param(body, &mut body_aliases, depth) {
+                if self.block_mutates_const_param(body, &mut body_aliases, &mut inner_breaks, depth) {
                     return true;
                 }
                 aliases.extend(body_aliases);
+                aliases.extend(inner_breaks);
             }
             Stmt::Managed { body, .. } | Stmt::Block { block: body, .. } => {
                 let mut body_aliases = aliases.clone();
-                if self.block_mutates_const_param(body, &mut body_aliases, depth) {
+                if self.block_mutates_const_param(body, &mut body_aliases, break_aliases, depth) {
                     return true;
                 }
                 aliases.extend(body_aliases);
@@ -7159,7 +7219,7 @@ impl<'a> Checker<'a> {
                             arm_aliases.remove(bname);
                         }
                     }
-                    if self.block_mutates_const_param(&arm.body, &mut arm_aliases, depth) {
+                    if self.block_mutates_const_param(&arm.body, &mut arm_aliases, break_aliases, depth) {
                         return true;
                     }
                     aliases.extend(arm_aliases);
@@ -7181,7 +7241,7 @@ impl<'a> Checker<'a> {
                         }
                         _ => {}
                     }
-                    if self.block_mutates_const_param(&arm.body, &mut arm_aliases, depth) {
+                    if self.block_mutates_const_param(&arm.body, &mut arm_aliases, break_aliases, depth) {
                         return true;
                     }
                     aliases.extend(arm_aliases);
@@ -7367,7 +7427,7 @@ impl<'a> Checker<'a> {
                             return true;
                         }
                     }
-                    self.block_mutates_const_param(body, &mut inner_aliases, depth)
+                    self.block_mutates_const_param(body, &mut inner_aliases, &mut HashSet::new(), depth)
                 }
             }
             Expr::Paren { inner, .. }
@@ -7519,7 +7579,7 @@ impl<'a> Checker<'a> {
                 if inner_aliases.is_empty() {
                     false
                 } else {
-                    self.block_mutates_const_param(body, &mut inner_aliases, depth + 1)
+                    self.block_mutates_const_param(body, &mut inner_aliases, &mut HashSet::new(), depth + 1)
                 }
             }
             _ => cr.args.iter().any(&arg_reaches_alias),

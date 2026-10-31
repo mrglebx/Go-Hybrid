@@ -672,6 +672,70 @@ impl FnState {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LoopBreakSnapshot {
+    pub aliases: HashMap<String, String>,
+    pub may_share: HashMap<String, HashSet<String>>,
+    pub non_owned_origins: Vec<(String, String)>,
+    pub moved: Vec<(String, MoveInfo)>,
+}
+
+impl LoopBreakSnapshot {
+    pub(crate) fn capture(st: &FnState, od: usize) -> Self {
+        let is_outer = |n: &str| {
+            st.env.contains_key(n) || st.scopes[..od.min(st.scopes.len())].iter().any(|s| s.contains_key(n))
+        };
+        let mut aliases = HashMap::new();
+        for (k, v) in &st.aliases {
+            if is_outer(k) {
+                let root = crate::freeze::resolve_alias(st, v);
+                if is_outer(&root) {
+                    aliases.insert(k.clone(), root);
+                } else if is_outer(v) {
+                    aliases.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let mut may_share = HashMap::new();
+        for (a, peers) in &st.may_share {
+            if is_outer(a) {
+                let outer_peers: HashSet<String> = peers.iter().filter(|p| is_outer(p)).cloned().collect();
+                if !outer_peers.is_empty() {
+                    may_share.insert(a.clone(), outer_peers);
+                }
+            }
+        }
+        let mut non_owned_origins = Vec::new();
+        let mut moved = Vec::new();
+        for (k, b) in st.env.iter().chain(st.scopes[..od.min(st.scopes.len())].iter().flat_map(|s| s.iter())) {
+            if let Some(orig) = &b.non_owned_origin {
+                non_owned_origins.push((k.clone(), orig.clone()));
+            }
+            if let Some(mv) = &b.moved {
+                moved.push((k.clone(), mv.clone()));
+            }
+        }
+        Self { aliases, may_share, non_owned_origins, moved }
+    }
+
+    pub(crate) fn apply(&self, st: &mut FnState) {
+        for (k, v) in &self.aliases { st.aliases.insert(k.clone(), v.clone()); }
+        for (a, peers) in &self.may_share {
+            for b in peers { st.share_edge(a, b); }
+        }
+        for (k, orig) in &self.non_owned_origins {
+            if let Some(b) = st.env_lookup_mut(k) {
+                if b.non_owned_origin.is_none() { b.non_owned_origin = Some(orig.clone()); }
+            }
+        }
+        for (k, mv) in &self.moved {
+            if let Some(b) = st.env_lookup_mut(k) {
+                if b.moved.is_none() { b.moved = Some(mv.clone()); }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The checker (file-level tables + accumulators)
 // ---------------------------------------------------------------------------

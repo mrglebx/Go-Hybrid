@@ -67,7 +67,7 @@ mod recv;
 use hy_diag::{Diagnostic, ManagedBlockAudit, ManagedReport, Severity};
 
 use hy_syntax::{Decl, Expr, File, FnDecl, ForKind, SelectArmKind, Stmt};
-use model::{Binding, Checker, FnState, MANAGED_CATEGORIES, TypeShape};
+use model::{Binding, Checker, FnState, LoopBreakSnapshot, MANAGED_CATEGORIES, TypeShape};
 
 /// The result of checking one file.
 #[derive(Debug, Default)]
@@ -437,6 +437,7 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
         usize,
         &hy_syntax::Block,
         std::collections::HashSet<String>,
+        Vec<LoopBreakSnapshot>,
     )> = Vec::new();
     let mut reported_backedge: std::collections::HashSet<String> =
         std::collections::HashSet::new();
@@ -484,7 +485,7 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                 .filter(|(_, b)| b.moved.is_some())
                 .map(|(k, _)| k.clone())
                 .collect();
-            active_loops.push((idx, flat.loop_end_of(idx), outer_depth, lbody, pre_moved));
+            active_loops.push((idx, flat.loop_end_of(idx), outer_depth, lbody, pre_moved, Vec::new()));
         }
         if let Stmt::Managed {
             reason,
@@ -871,16 +872,48 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                 );
             }
 
+            Stmt::Break { label, .. } => {
+                let in_enclosing_select = flat.select_end.iter().any(|(&s_start, &s_end)| {
+                    s_start < idx
+                        && idx <= s_end
+                        && active_loops
+                            .last()
+                            .map_or(true, |(f_idx, _, _, _, _, _)| *f_idx < s_start)
+                });
+                if (!in_enclosing_select || label.is_some()) && !active_loops.is_empty() {
+                    let target_idx = if let Some(lbl) = label {
+                        if lbl == "loop" {
+                            active_loops
+                                .iter()
+                                .rposition(|(f_idx, _, _, _, _, _)| {
+                                    flat.infinite_loop_end.contains_key(f_idx)
+                                })
+                                .unwrap_or_else(|| active_loops.len() - 1)
+                        } else {
+                            active_loops.len() - 1
+                        }
+                    } else {
+                        active_loops.len() - 1
+                    };
+                    let od = active_loops[target_idx].2;
+                    active_loops[target_idx].5.push(LoopBreakSnapshot::capture(&st, od));
+                }
+            }
+
             // If-init Locals and blocks: already covered by the flat walk
             // (init is its own statement entry) and the uses/calls collected above.
             _ => {}
         }
 
-        while let Some((_, loop_end, _, _, _)) = active_loops.last() {
+        while let Some((_, loop_end, _, _, _, _)) = active_loops.last() {
             if *loop_end != idx {
                 break;
             }
-            let (for_idx, loop_end, outer_depth, lbody, pre_moved) = active_loops.pop().unwrap();
+            let (for_idx, loop_end, outer_depth, lbody, pre_moved, break_snaps) =
+                active_loops.pop().unwrap();
+            for snap in &break_snaps {
+                snap.apply(&mut st);
+            }
             ck.check_loop_backedge(
                 &st,
                 outer_depth,

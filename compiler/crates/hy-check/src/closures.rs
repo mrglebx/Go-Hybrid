@@ -26,7 +26,13 @@
 //!     subset — corpus 10's `hits++` handler shape is the standing example
 //!     (A5, QUESTIONS.md Q1/OQ1: pre-registered ACCEPT, contested openly).
 
-use crate::model::{Binding, Checker, FnState, TypeShape};
+use crate::model::{Binding, Checker, FnState, LoopBreakSnapshot, TypeShape};
+
+struct LoopScopeBreak {
+    outer_depth: usize,
+    in_select: bool,
+    snaps: Vec<LoopBreakSnapshot>,
+}
 use hy_syntax::ForKind::*;
 use hy_syntax::{Block, Expr, LocalKind, SelectArmKind, Stmt};
 
@@ -268,7 +274,7 @@ fn check_one_closure(
     let mut nested = Vec::new();
     cst.scope_push();
     check_closure_slot_loans(ck, &mut cst, body);
-    check_body_boundaries(ck, &mut cst, body, false, &mut nested);
+    check_body_boundaries(ck, &mut cst, body, false, &mut nested, &mut Vec::new());
     sync_nested_moves(&cst, &mut nested);
     for nc in nested {
         let mut snap = cst.clone();
@@ -327,9 +333,10 @@ fn check_body_boundaries<'a>(
     block: &'a Block,
     managed: bool,
     nested: &mut Vec<NestedClosure<'a>>,
+    breaks: &mut Vec<LoopScopeBreak>,
 ) {
     for stmt in &block.stmts {
-        check_stmt_boundaries(ck, st, stmt, managed, nested);
+        check_stmt_boundaries(ck, st, stmt, managed, nested, breaks);
     }
 }
 
@@ -420,7 +427,7 @@ fn check_stmt_own_uses(ck: &mut Checker<'_>, st: &mut FnState, stmt: &Stmt, mana
     ck.check_uses(st, &uses);
 }
 
-fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a Stmt, managed: bool, nested: &mut Vec<NestedClosure<'a>>) {
+fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a Stmt, managed: bool, nested: &mut Vec<NestedClosure<'a>>, breaks: &mut Vec<LoopScopeBreak>) {
     // Check uses on every statement in the closure BEFORE any new defines or
     // move transfers on this statement take effect (#29). For `Stmt::If`,
     // init executes BEFORE `cond`, so `cond`'s uses are checked after `init`
@@ -921,7 +928,13 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                     }
                     SelectArmKind::Default => {}
                 }
-                check_body_boundaries(ck, st, &arm.body, managed, nested);
+                if let Some(lb) = breaks.last_mut() {
+                    lb.in_select = true;
+                }
+                check_body_boundaries(ck, st, &arm.body, managed, nested, breaks);
+                if let Some(lb) = breaks.last_mut() {
+                    lb.in_select = false;
+                }
                 pop_scope_and_sync(st, nested);
             }
         }
@@ -934,7 +947,7 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
         } => {
             ck.audit_managed_block(reason, category, tickets, *span);
             st.scope_push();
-            check_body_boundaries(ck, st, body, true, nested);
+            check_body_boundaries(ck, st, body, true, nested, breaks);
             pop_scope_and_sync(st, nested);
         }
         Stmt::If {
@@ -948,7 +961,7 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
             // construct, Go rule); the then/else bodies open their own.
             st.scope_push();
             if let Some(i) = init {
-                check_stmt_boundaries(ck, st, i, managed, nested);
+                check_stmt_boundaries(ck, st, i, managed, nested, breaks);
             }
             check_stmt_own_uses(ck, st, stmt, managed);
             ck.mark_move_in_value(
@@ -959,10 +972,10 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
             sync_nested_moves(st, nested);
             collect_expr_direct_fnlits(cond, st, nested);
             st.scope_push();
-            check_body_boundaries(ck, st, then, managed, nested);
+            check_body_boundaries(ck, st, then, managed, nested, breaks);
             pop_scope_and_sync(st, nested);
             if let Some(o) = otherwise {
-                check_stmt_boundaries(ck, st, o, managed, nested);
+                check_stmt_boundaries(ck, st, o, managed, nested, breaks);
             }
             pop_scope_and_sync(st, nested);
         }
@@ -1044,7 +1057,16 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                 Infinite => {}
             }
             st.scope_push(); // the body's own scope
-            check_body_boundaries(ck, st, body, managed, nested);
+            breaks.push(LoopScopeBreak {
+                outer_depth,
+                in_select: false,
+                snaps: Vec::new(),
+            });
+            check_body_boundaries(ck, st, body, managed, nested, breaks);
+            let loop_break = breaks.pop().unwrap();
+            for snap in &loop_break.snaps {
+                snap.apply(st);
+            }
             if !managed {
                 let flat_body = crate::walk::flatten(body);
                 let mut loop_stmts: Vec<(&Stmt, usize)> =
@@ -1114,14 +1136,21 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                     sync_nested_moves(st, nested);
                     collect_expr_direct_fnlits(g, st, nested);
                 }
-                check_body_boundaries(ck, st, &arm.body, managed, nested);
+                check_body_boundaries(ck, st, &arm.body, managed, nested, breaks);
                 pop_scope_and_sync(st, nested);
             }
         }
         Stmt::Block { block, .. } => {
             st.scope_push();
-            check_body_boundaries(ck, st, block, managed, nested);
+            check_body_boundaries(ck, st, block, managed, nested, breaks);
             pop_scope_and_sync(st, nested);
+        }
+        Stmt::Break { label, .. } => {
+            if let Some(lb) = breaks.last_mut() {
+                if !lb.in_select || label.is_some() {
+                    lb.snaps.push(LoopBreakSnapshot::capture(st, lb.outer_depth));
+                }
+            }
         }
         Stmt::Assign {
             targets,
